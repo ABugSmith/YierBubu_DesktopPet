@@ -1,5 +1,9 @@
 ﻿# 来源、致谢与权利说明
 
+## 创作灵感
+
+特别感谢抖音用户 **「李达康」**（抖音号：**67810150099**）。正是在观看他的视频后，才萌生了制作这个一二布布桌宠的想法。感谢他分享的视频与创意，为项目带来了最初的灵感和动手实现的动力。
+
 ## BongoCat
 
 本项目引用并参考 [ayangweb/BongoCat](https://github.com/ayangweb/BongoCat) 的桌面宠物交互思路。BongoCat 的作者与贡献者保有其作品的权利；上游仓库标注 Apache-2.0，具体以[上游 LICENSE](https://github.com/ayangweb/BongoCat/blob/master/LICENSE) 为准。
