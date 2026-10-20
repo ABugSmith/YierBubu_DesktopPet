@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -10,6 +10,10 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 
+[assembly: System.Reflection.AssemblyVersion("1.0.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.0.1.0")]
+[assembly: System.Reflection.AssemblyProduct("YierBubu")]
+
 namespace YierBubu
 {
     enum Hand { None, Left, Right }
@@ -19,9 +23,19 @@ namespace YierBubu
         public long Device;
         public ushort Scan;
         public bool Extended;
-        public bool Equals(PhysicalKey other) { return Device == other.Device && Scan == other.Scan && Extended == other.Extended; }
+        public bool E1;
+        public int Code { get { return Scan | (Extended ? 0x100 : 0) | (E1 ? 0x200 : 0); } }
+        public bool Equals(PhysicalKey other) { return Device == other.Device && Scan == other.Scan && Extended == other.Extended && E1 == other.E1; }
         public override bool Equals(object obj) { return obj is PhysicalKey && Equals((PhysicalKey)obj); }
-        public override int GetHashCode() { return Device.GetHashCode() ^ (Scan << 1) ^ (Extended ? 1 : 0); }
+        public override int GetHashCode() { return Device.GetHashCode() ^ (Code << 1); }
+        public static PhysicalKey FromRaw(long device, ushort scan, ushort flags, ushort vk)
+        {
+            var key = new PhysicalKey { Device = device, Scan = scan, Extended = (flags & 2) != 0, E1 = (flags & 4) != 0 };
+            if (vk == 0x13) { key.Scan = 0x45; key.Extended = false; key.E1 = true; }
+            if (vk == 0x90) { key.Scan = 0x45; key.Extended = false; key.E1 = false; }
+            if (vk == 0x2c) { key.Scan = 0x37; key.Extended = true; key.E1 = false; }
+            return key;
+        }
     }
 
     sealed class HeldKey
@@ -34,6 +48,7 @@ namespace YierBubu
     sealed class InputState
     {
         readonly Dictionary<PhysicalKey, HeldKey> held = new Dictionary<PhysicalKey, HeldKey>();
+        readonly Dictionary<PhysicalKey, long> pulses = new Dictionary<PhysicalKey, long>();
         long leftUntil, rightUntil;
         public int Count { get { return held.Count; } }
 
@@ -58,6 +73,7 @@ namespace YierBubu
             Hand hand = Classify(key.Scan, key.Extended);
             if (hand == Hand.None) return;
             held.Add(key, new HeldKey { Hand = hand, VirtualKey = virtualKey, Since = now });
+            pulses[key] = now + 140;
             if (hand == Hand.Left) leftUntil = now + 90;
             else rightUntil = now + 90;
         }
@@ -66,6 +82,33 @@ namespace YierBubu
         {
             foreach (HeldKey key in held.Values) if (key.Hand == side) return true;
             return now < (side == Hand.Left ? leftUntil : rightUntil);
+        }
+
+        public SortedSet<int> VisibleKeys(long now)
+        {
+            var result = new SortedSet<int>();
+            foreach (PhysicalKey key in held.Keys) result.Add(key.Code);
+            foreach (PhysicalKey key in new List<PhysicalKey>(pulses.Keys))
+                if (now < pulses[key]) result.Add(key.Code); else pulses.Remove(key);
+            return result;
+        }
+        public int? LatestKey(Hand side, long now)
+        {
+            int? selected = null; int rank = -1; long time = long.MinValue;
+            foreach (var pair in held)
+            {
+                if (pair.Value.Hand != side) continue;
+                int r = KeyboardLayout.IsModifier(pair.Key.Code) ? 0 : 1;
+                if (r > rank || (r == rank && pair.Value.Since >= time)) { selected = pair.Key.Code; rank = r; time = pair.Value.Since; }
+            }
+            if (selected.HasValue) return selected;
+            foreach (var pair in pulses)
+            {
+                if (now >= pair.Value || Classify(pair.Key.Scan, pair.Key.Extended) != side) continue;
+                int r = KeyboardLayout.IsModifier(pair.Key.Code) ? 0 : 1;
+                if (r > rank || (r == rank && pair.Value >= time)) { selected = pair.Key.Code; rank = r; time = pair.Value; }
+            }
+            return selected;
         }
 
         public void Reconcile(Func<int, bool> isDown, long now)
@@ -81,16 +124,17 @@ namespace YierBubu
             var removed = new List<PhysicalKey>();
             foreach (PhysicalKey key in held.Keys) if (key.Device == device) removed.Add(key);
             foreach (PhysicalKey key in removed) held.Remove(key);
+            foreach (PhysicalKey key in new List<PhysicalKey>(pulses.Keys)) if (key.Device == device) pulses.Remove(key);
             leftUntil = rightUntil = 0;
         }
 
-        public void Reset() { held.Clear(); leftUntil = rightUntil = 0; }
+        public void Reset() { held.Clear(); pulses.Clear(); leftUntil = rightUntil = 0; }
     }
 
     sealed class MouseState
     {
         readonly Dictionary<long, int> devices = new Dictionary<long, int>();
-        long leftUntil, rightUntil;
+        long leftUntil, rightUntil, middleUntil;
         public void Edges(long device, ushort flags, long now)
         {
             int bits; devices.TryGetValue(device, out bits);
@@ -98,6 +142,8 @@ namespace YierBubu
             if ((flags & 2) != 0) bits &= ~1;
             if ((flags & 4) != 0) { bits |= 2; rightUntil = now + 90; }
             if ((flags & 8) != 0) bits &= ~2;
+            if ((flags & 16) != 0) { bits |= 4; middleUntil = now + 140; }
+            if ((flags & 32) != 0) bits &= ~4;
             if (bits == 0) devices.Remove(device); else devices[device] = bits;
         }
         public bool Active(bool left, long now)
@@ -106,17 +152,22 @@ namespace YierBubu
             foreach (int bits in devices.Values) if ((bits & mask) != 0) return true;
             return now < (left ? leftUntil : rightUntil);
         }
+        public bool Middle(long now)
+        {
+            foreach (int bits in devices.Values) if ((bits & 4) != 0) return true;
+            return now < middleUntil;
+        }
         public void Reconcile(Func<int, bool> down, long now)
         {
-            int mask = (!down(1) && now >= leftUntil ? 1 : 0) | (!down(2) && now >= rightUntil ? 2 : 0);
+            int mask = (!down(1) && now >= leftUntil ? 1 : 0) | (!down(2) && now >= rightUntil ? 2 : 0) | (!down(4) && now >= middleUntil ? 4 : 0);
             foreach (long device in new List<long>(devices.Keys))
             {
                 int bits = devices[device] & ~mask;
                 if (bits == 0) devices.Remove(device); else devices[device] = bits;
             }
         }
-        public void RemoveDevice(long device) { devices.Remove(device); leftUntil = rightUntil = 0; }
-        public void Reset() { devices.Clear(); leftUntil = rightUntil = 0; }
+        public void RemoveDevice(long device) { devices.Remove(device); leftUntil = rightUntil = middleUntil = 0; }
+        public void Reset() { devices.Clear(); leftUntil = rightUntil = middleUntil = 0; }
     }
 
     sealed class PetConfig
@@ -186,11 +237,26 @@ namespace YierBubu
         readonly Bitmap sheet;
         readonly Bitmap bubuSheet;
         readonly Rectangle[] bubuSources = new Rectangle[4];
+        readonly Rectangle[] mouseSources = new Rectangle[4];
         int bubuWidth, bubuHeight;
         public SpriteRenderer(string path)
         {
-            sheet = new Bitmap(path);
+            sheet = new Bitmap(Path.Combine(Path.GetDirectoryName(path), "yier-body-underlay-v1.png"));
             if (sheet.Width < 800 || sheet.Height < 400) throw new InvalidDataException("Sprite sheet is too small.");
+            // Runtime palette correction restricted to the bow and neckband.
+            // Keep the source PNG intact and all face/ear colors unchanged.
+            float cell = sheet.Width / 4f, sy = sheet.Height / 887f;
+            for (int pose = 0; pose < 4; pose++)
+            for (int y = (int)(290 * sy); y < (int)(335 * sy); y++)
+            for (int x = (int)(pose * cell + 125 * cell / 443.5f); x < (int)(pose * cell + 320 * cell / 443.5f); x++)
+            {
+                Color c = sheet.GetPixel(x, y);
+                float localX = (x - pose * cell) * 443.5f / cell, localY = y / sy;
+                bool bow = localX >= 183 && localX <= 263;
+                bool band = localY >= 306 && localY <= 324;
+                if ((bow || band) && c.A > 0 && Math.Max(c.R, Math.Max(c.G, c.B)) < 170)
+                    sheet.SetPixel(x, y, Color.FromArgb(c.A, 0, 0, 0));
+            }
             bubuSheet = new Bitmap(Path.Combine(Path.GetDirectoryName(path), "bubu-single-paw-v1.png"));
             if (bubuSheet.Width < 400 || bubuSheet.Height < 400) throw new InvalidDataException("Bubu sprite sheet is too small.");
             for (int pose = 0; pose < 4; pose++)
@@ -198,19 +264,25 @@ namespace YierBubu
                 int x0 = (pose % 2) * bubuSheet.Width / 2, x1 = (pose % 2 + 1) * bubuSheet.Width / 2;
                 int y0 = (pose / 2) * bubuSheet.Height / 2, y1 = (pose / 2 + 1) * bubuSheet.Height / 2;
                 int left = x1, top = y1, right = x0, bottom = y0;
+                int ml = x1, mt = y1, mr = x0, mb = y0;
                 // Cached source bounds only: the PNG is never rewritten or modified.
                 for (int y = y0; y < y1; y++)
                 for (int x = x0; x < x1; x++)
-                    if (bubuSheet.GetPixel(x, y).A > 24)
-                    { left = Math.Min(left, x); top = Math.Min(top, y); right = Math.Max(right, x + 1); bottom = Math.Max(bottom, y + 1); }
+                {
+                    Color pixel = bubuSheet.GetPixel(x, y);
+                    if (pixel.A > 24) { left = Math.Min(left, x); top = Math.Min(top, y); right = Math.Max(right, x + 1); bottom = Math.Max(bottom, y + 1); }
+                    if (pixel.A > 128 && pixel.B > pixel.R + 30 && pixel.G > 130) { ml = Math.Min(ml, x); mt = Math.Min(mt, y); mr = Math.Max(mr, x + 1); mb = Math.Max(mb, y + 1); }
+                }
                 if (left >= right || top >= bottom) throw new InvalidDataException("A Bubu pose is empty.");
                 bubuSources[pose] = Rectangle.FromLTRB(Math.Max(x0, left - 2), Math.Max(y0, top - 2), Math.Min(x1, right + 2), Math.Min(y1, bottom + 2));
                 bubuWidth = Math.Max(bubuWidth, bubuSources[pose].Width);
                 bubuHeight = Math.Max(bubuHeight, bubuSources[pose].Height);
+                if (ml >= mr || mt >= mb) throw new InvalidDataException("A Bubu pose has no blue mouse.");
+                mouseSources[pose] = Rectangle.FromLTRB(ml, mt, mr, mb);
             }
         }
 
-        void Bubu(Graphics g, int pose, RectangleF target)
+        void Bubu(Graphics g, int pose, RectangleF target, bool feedback = false, bool mouseLeft = false, bool mouseRight = false, bool mouseMiddle = false)
         {
             Rectangle source = bubuSources[pose];
             float scale = Math.Min(target.Width / bubuWidth, target.Height / bubuHeight) * 0.94f;
@@ -222,6 +294,15 @@ namespace YierBubu
             // on the left, while his mouse stays on the outer screen-left paw.
             var corners = new[] { new PointF(dest.Right, dest.Top), new PointF(dest.Left, dest.Top), new PointF(dest.Right, dest.Bottom) };
             g.DrawImage(bubuSheet, corners, source, GraphicsUnit.Pixel);
+            if (feedback)
+            {
+                Rectangle blue = mouseSources[pose];
+                var mouse = new RectangleF(dest.X + (blue.X - source.X) * scale, dest.Y + (blue.Y - source.Y) * scale, blue.Width * scale, blue.Height * scale);
+                GraphicsState saved = g.Save();
+                g.TranslateTransform(dest.Left + dest.Right, 0); g.ScaleTransform(-1, 1);
+                InputArtwork.Mouse(g, mouse, mouseLeft, mouseRight, mouseMiddle);
+                g.Restore(saved);
+            }
         }
 
         void Sprite(Graphics g, int row, int column, RectangleF target)
@@ -233,7 +314,17 @@ namespace YierBubu
             g.DrawImage(sheet, target, source, GraphicsUnit.Pixel);
         }
 
-        public static int HeightFor(int width) { return (int)Math.Ceiling(width * 0.59); }
+        public static int HeightFor(int width)
+        {
+            return (int)Math.Ceiling(width * 0.608f + 6 + Math.Max(2, width * 0.009f));
+        }
+        public static RectangleF KeyboardBounds(int width, double gapRatio)
+        {
+            float pet = width * (1f - (float)gapRatio) / 2;
+            float scale = KeyboardLayout.Scale;
+            return new RectangleF(width - pet + pet * (0.015f + 0.97f * (1 - scale) / 2),
+                pet * 410f / 355f * 0.80f, pet * 0.97f * scale, pet * 0.29f * scale);
+        }
         public static int KeyboardPose(bool left, bool right, bool happy) { return left && right ? 0 : left ? 1 : right ? 2 : happy ? 3 : 0; }
         public static int BubuPose(int gaze, bool left, bool right) { return left || right ? 3 : gaze < 0 ? 1 : gaze > 0 ? 2 : 0; }
 
@@ -251,7 +342,7 @@ namespace YierBubu
             return frame;
         }
 
-        public Bitmap Render(int width, bool left, bool right, int gaze, bool mouseLeft, bool mouseRight, bool happy, double gapRatio)
+        public Bitmap Render(int width, bool left, bool right, int gaze, bool mouseLeft, bool mouseRight, bool happy, double gapRatio, ISet<int> pressed = null, bool mouseMiddle = false, PawFrame motion = null, bool showHands = true)
         {
             int height = HeightFor(width);
             var frame = new Bitmap(width, height, PixelFormat.Format32bppPArgb);
@@ -268,21 +359,8 @@ namespace YierBubu
                 var yier = new RectangleF(0, 0, pet, bodyHeight);
                 int pose = KeyboardPose(left, right, happy);
                 Sprite(g, 0, pose, yier);
-                if (left && right)
-                {
-                    // Compose independent lower halves from the two paw poses.
-                    // Only the body/paws area changes; face and keyboard remain anchored.
-                    GraphicsState saved = g.Save();
-                    g.SetClip(new RectangleF(0, bodyHeight * 0.65f, pet / 2, bodyHeight * 0.24f));
-                    Sprite(g, 0, 1, yier);
-                    g.Restore(saved);
-                    saved = g.Save();
-                    g.SetClip(new RectangleF(pet / 2, bodyHeight * 0.65f, pet / 2, bodyHeight * 0.24f));
-                    Sprite(g, 0, 2, yier);
-                    g.Restore(saved);
-                }
                 var bubuTarget = new RectangleF(width - pet, 0, pet, bodyHeight);
-                Bubu(g, BubuPose(gaze, mouseLeft, mouseRight), bubuTarget);
+                Bubu(g, BubuPose(gaze, mouseLeft || mouseMiddle, mouseRight), bubuTarget, true, mouseLeft, mouseRight, mouseMiddle);
                 // Small visual hand indicators also make simultaneous chords unambiguous.
                 using (var on = new SolidBrush(Color.FromArgb(240, 152, 124, 211)))
                 using (var off = new SolidBrush(Color.FromArgb(110, 160, 151, 175)))
@@ -293,6 +371,17 @@ namespace YierBubu
                     g.FillEllipse(mouseLeft ? on : off, bubuTarget.X + pet * 0.36f, height - dot, dot, dot);
                     g.FillEllipse(mouseRight ? on : off, bubuTarget.X + pet * 0.64f, height - dot, dot, dot);
                 }
+                g.ResetTransform();
+                RectangleF board = KeyboardBounds(width, gapRatio);
+                InputArtwork.Keyboard(g, board, pressed);
+                if (showHands)
+                {
+                    if (motion == null) motion = new PawFrame(HandAnimator.Target(board, KeyboardLayout.FromSet(pressed, Hand.Left), Hand.Left), HandAnimator.Target(board, KeyboardLayout.FromSet(pressed, Hand.Right), Hand.Right), false);
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    InputArtwork.Arm(g, HandAnimator.Shoulder(board, Hand.Right), motion.Right, pet);
+                    InputArtwork.Arm(g, HandAnimator.Shoulder(board, Hand.Left), motion.Left, pet);
+                }
+                InputArtwork.PressedMarkers(g, board, pressed);
             }
             return frame;
         }
@@ -304,6 +393,7 @@ namespace YierBubu
     {
         readonly InputState input = new InputState();
         readonly MouseState mouseInput = new MouseState();
+        readonly HandAnimator arms = new HandAnimator();
         readonly PetConfig config;
         readonly string configPath;
         readonly Stopwatch clock = Stopwatch.StartNew();
@@ -316,6 +406,8 @@ namespace YierBubu
         int petWidth, lastState = -1;
         long lastInput, lastReconcile;
         int rawEvents;
+        string lastKeySignature;
+        bool lastArmsMoving;
         int smokeResizeStep;
 
         public PetWindow(string asset, bool smokeMode)
@@ -383,6 +475,7 @@ namespace YierBubu
             Rectangle work = Screen.FromControl(this).WorkingArea;
             Location = new Point(Math.Max(work.Left, Math.Min(Left, work.Right - Width)), Math.Max(work.Top, Math.Min(Top, work.Bottom - Height)));
             lastState = -1;
+            arms.Reset();
             if (save && !smoke)
             {
                 config.Width = petWidth;
@@ -416,13 +509,14 @@ namespace YierBubu
                 if (header.Type != 1) return;
                 var key = (Native.RawKeyboard)Marshal.PtrToStructure(IntPtr.Add(buffer, (int)headerSize), typeof(Native.RawKeyboard));
                 if (key.VKey == 255 || key.Scan == 0xff) return;
-                bool extended = (key.Flags & 6) != 0;
+                PhysicalKey physical = PhysicalKey.FromRaw(header.Device.ToInt64(), key.Scan, key.Flags, key.VKey);
+                bool extended = physical.Extended;
                 int vk = key.VKey;
                 if (vk == 16) vk = key.Scan == 54 ? 0xa1 : 0xa0;
                 else if (vk == 17) vk = extended ? 0xa3 : 0xa2;
                 else if (vk == 18) vk = extended ? 0xa5 : 0xa4;
                 long now = clock.ElapsedMilliseconds;
-                input.Edge(new PhysicalKey { Device = header.Device.ToInt64(), Scan = key.Scan, Extended = extended }, vk, (key.Flags & 1) == 0, now);
+                input.Edge(physical, vk, (key.Flags & 1) == 0, now);
                 lastInput = now;
                 rawEvents++;
             }
@@ -452,21 +546,36 @@ namespace YierBubu
             if (now - lastReconcile >= 120) { input.Reconcile(Native.Down, now); mouseInput.Reconcile(Native.Down, now); lastReconcile = now; }
             bool left = input.Active(Hand.Left, now), right = input.Active(Hand.Right, now);
             bool mouseLeft = mouseInput.Active(true, now), mouseRight = mouseInput.Active(false, now);
+            bool mouseMiddle = mouseInput.Middle(now);
+            SortedSet<int> visibleKeys = input.VisibleKeys(now);
             int relative = Cursor.Position.X - (Left + (int)(Width * 0.25));
             int threshold = Math.Max(20, Width / 7);
             int gaze = relative < -threshold ? -1 : relative > threshold ? 1 : 0;
             if (smoke) gaze = (int)(now / 350) % 3 - 1;
-            bool happy = !left && !right && now - lastInput > 5000;
-            int state = (left ? 1 : 0) | (right ? 2 : 0) | ((gaze + 1) << 2) | (mouseLeft ? 16 : 0) | (happy ? 32 : 0) | (mouseRight ? 64 : 0);
-            if (lastState != state)
+            if (smoke)
             {
-                using (Bitmap bitmap = renderer.Render(petWidth, left, right, gaze, mouseLeft, mouseRight, happy, config.GapRatio)) Present(bitmap);
-                lastState = state;
+                int phase = (int)(now / 650) % 4;
+                visibleKeys = new SortedSet<int>(phase == 0 ? new[] { 0x1e } : phase == 1 ? new[] { 0x1f } : phase == 2 ? new[] { 0x1e, 0x26 } : new[] { 0x11c });
+                left = phase != 3; right = phase >= 2;
+                mouseLeft = phase == 1; mouseRight = phase == 2; mouseMiddle = phase == 3;
             }
+            bool happy = !left && !right && now - lastInput > 5000;
+            int? leftTarget = smoke ? KeyboardLayout.FromSet(visibleKeys, Hand.Left) : input.LatestKey(Hand.Left, now);
+            int? rightTarget = smoke ? KeyboardLayout.FromSet(visibleKeys, Hand.Right) : input.LatestKey(Hand.Right, now);
+            PawFrame handFrame = arms.Step(SpriteRenderer.KeyboardBounds(petWidth, config.GapRatio), leftTarget, rightTarget, now);
+            int state = (left ? 1 : 0) | (right ? 2 : 0) | ((gaze + 1) << 2) | (mouseLeft ? 16 : 0) | (happy ? 32 : 0) | (mouseRight ? 64 : 0) | (mouseMiddle ? 128 : 0);
+            string signature = string.Join(",", visibleKeys);
+            if (lastState != state || lastKeySignature != signature || handFrame.Moving || lastArmsMoving)
+            {
+                using (Bitmap bitmap = renderer.Render(petWidth, left, right, gaze, mouseLeft, mouseRight, happy, config.GapRatio, visibleKeys, mouseMiddle, handFrame)) Present(bitmap);
+                lastState = state;
+                lastKeySignature = signature;
+            }
+            lastArmsMoving = handFrame.Moving;
             if (smoke && now > 4000)
             {
                 File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "smoke.txt"),
-                    "PASS: exclusive full-body Bubu poses cycled left/center/right; mirrored layered window rendered; keyboard and mouse Raw Input registered; live resize to 280 and back completed; clean exit requested.\r\nKeyboard event count: " + rawEvents + "\r\nPhysical key/button behavior requires manual acceptance.\r\n");
+                    "PASS: animated A/S/two-hand/numpad reach; mouse feedback without letters; no caption strip; gaze and Raw Input; resize/reset; clean exit.\r\nKeyboard event count: " + rawEvents + "\r\nSmoke uses in-app snapshots, not synthesized OS input. Physical key/button behavior requires manual acceptance.\r\n");
                 Close();
             }
         }
@@ -515,7 +624,7 @@ namespace YierBubu
         static void ReplacePreviousInstance(string root)
         {
             int current = Process.GetCurrentProcess().Id;
-            foreach (string name in new[] { "YierBubu", "YierBubu-v2", "YierBubu-v3", "YierBubu-v4" })
+            foreach (string name in new[] { "YierBubu", "YierBubu-v2", "YierBubu-v3", "YierBubu-v4", "YierBubu-1.0.1", "YierBubu-1.0.1-r2", "YierBubu-1.0.1-r3", "YierBubu-1.0.1-r4", "YierBubu-1.0.1-r5", "YierBubu-1.0.1-r6", "YierBubu-1.0.1-r7" })
             foreach (Process process in Process.GetProcessesByName(name))
             using (process)
             {
@@ -539,8 +648,30 @@ namespace YierBubu
         static void Assert(bool value, string message) { if (!value) throw new Exception("Test failed: " + message); }
         static PhysicalKey Key(ushort scan, long device) { return new PhysicalKey { Scan = scan, Device = device }; }
 
+        static int GoldPixels(Bitmap frame, RectangleF bounds)
+        {
+            int count = 0;
+            Rectangle r = Rectangle.Intersect(Rectangle.Ceiling(bounds), new Rectangle(0, 0, frame.Width, frame.Height));
+            for (int y = r.Top; y < r.Bottom; y++)
+            for (int x = r.Left; x < r.Right; x++)
+            { Color c = frame.GetPixel(x, y); if (c.A > 150 && c.R > 235 && c.G > 185 && c.G < 220 && c.B < 105) count++; }
+            return count;
+        }
+
         static void SelfTest(string asset, string root)
         {
+            using (var arm = new Bitmap(160, 160))
+            using (Graphics g = Graphics.FromImage(arm))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                InputArtwork.Arm(g, new PointF(70, 30), new PointF(70, 130), 200);
+                int whiteWidth = 0;
+                for (int x = 0; x < arm.Width; x++)
+                { Color c = arm.GetPixel(x, 70); if (c.A > 240 && c.R > 245 && c.G > 245 && c.B > 245) whiteWidth++; }
+                Assert(whiteWidth >= 30, "broad rounded arm retains a thick white core");
+                for (int y = 35; y < 122; y++)
+                { Color c = arm.GetPixel(70, y); Assert(c.A > 240 && c.R > 245 && c.G > 245 && c.B > 245, "continuous mitten without wrist seam"); }
+            }
             var state = new InputState();
             Assert(InputState.Classify(30, false) == Hand.Left && InputState.Classify(36, false) == Hand.Right, "A/J physical banks");
             Assert(InputState.Classify(57, false) == Hand.Left && InputState.Classify(29, true) == Hand.Right, "space / right control");
@@ -578,7 +709,7 @@ namespace YierBubu
                 }
                 using (Bitmap small = renderer.Render(187, false, false, 0, false, false, true, 0))
                 {
-                    Assert(small.Width == 187 && small.Height == 111, "one-third default width with uncropped ears");
+                    Assert(small.Width == 187 && small.Height == 122, "compact width without caption bar");
                     small.Save(Path.Combine(root, "default-size-preview.png"), ImageFormat.Png);
                 }
                 using (Bitmap buttons = new Bitmap(1120, h * 2))
@@ -600,7 +731,7 @@ namespace YierBubu
                     using (Bitmap actual = renderer.Render(width, false, false, gaze, (buttons & 1) != 0, (buttons & 2) != 0, false, gap))
                     using (Bitmap expected = renderer.BubuReference(width, expectedPose, gap))
                     {
-                        for (int y = 0; y < actual.Height * 0.85; y++)
+                        for (int y = 0; y < width * 0.59 * 0.70; y++)
                         for (int x = 0; x < width / 2; x++)
                             Assert(actual.GetPixel(x, y).ToArgb() == expected.GetPixel(x, y).ToArgb(), "exclusive Bubu head/ears at width " + width + ", gaze " + gaze + ", buttons " + buttons);
                     }
@@ -627,6 +758,165 @@ namespace YierBubu
                         g.DrawImageUnscaled(frame, buttons * 560, (gaze + 1) * h);
                     looks.Save(Path.Combine(root, "look-preview.png"), ImageFormat.Png);
                 }
+                var codes = new HashSet<int>();
+                Assert(KeyboardLayout.Keys.Count == 104, "104-key ANSI layout");
+                foreach (KeyCap cap in KeyboardLayout.Keys)
+                {
+                    Assert(codes.Add(cap.Code), "no duplicate physical key codes");
+                    using (Bitmap frame = renderer.Render(720, false, false, 0, false, false, false, 0, new SortedSet<int> { cap.Code }))
+                        Assert(GoldPixels(frame, KeyboardLayout.Bounds(SpriteRenderer.KeyboardBounds(720, 0), cap)) > 0, "specific key highlight: " + KeyboardLayout.Name(cap.Code));
+                }
+                using (Bitmap chord = renderer.Render(560, true, false, 0, false, false, false, 0, new SortedSet<int> { 0x1d, 0x1e }))
+                {
+                    foreach (KeyCap cap in KeyboardLayout.Keys)
+                        if (cap.Code == 0x1d || cap.Code == 0x1e) Assert(GoldPixels(chord, KeyboardLayout.Bounds(SpriteRenderer.KeyboardBounds(560, 0), cap)) > 0, "chord highlights both keys");
+                    chord.Save(Path.Combine(root, "exact-key-preview.png"), ImageFormat.Png);
+                }
+                using (Bitmap none = renderer.Render(560, false, false, 0, false, false, false, 0))
+                using (Bitmap onlyA = renderer.Render(560, true, false, 0, false, false, false, 0, new SortedSet<int> { 0x1e }))
+                {
+                    foreach (KeyCap cap in KeyboardLayout.Keys)
+                        if (cap.Code == 0x1e || cap.Code == 0x1f)
+                        {
+                            RectangleF r = KeyboardLayout.Bounds(SpriteRenderer.KeyboardBounds(560, 0), cap);
+                            Assert(GoldPixels(none, r) == 0, "key highlight cleared");
+                            if (cap.Code == 0x1f) Assert(GoldPixels(onlyA, r) == 0, "neighbor S is not highlighted by A");
+                        }
+                }
+                using (Bitmap preview = new Bitmap(1120, SpriteRenderer.HeightFor(560) * 2))
+                using (Graphics g = Graphics.FromImage(preview))
+                {
+                    int[][] combos = { new[] { 0x1e }, new[] { 0x1f }, new[] { 0x1d, 0x2a, 0x1e }, new[] { 0x11c, 0x148, 0x3b } };
+                    for (int i = 0; i < 4; i++)
+                    using (Bitmap frame = renderer.Render(560, i != 3, i == 3, 0, i == 0, i == 1, false, 0, new SortedSet<int>(combos[i]), i == 2))
+                        g.DrawImageUnscaled(frame, i % 2 * 560, i / 2 * SpriteRenderer.HeightFor(560));
+                    preview.Save(Path.Combine(root, "input-preview.png"), ImageFormat.Png);
+                }
+                using (Bitmap leftClick = renderer.Render(560, false, false, 0, true, false, false, 0))
+                using (Bitmap rightClick = renderer.Render(560, false, false, 0, false, true, false, 0))
+                using (Bitmap idleClick = renderer.Render(560, false, false, 0, false, false, false, 0))
+                {
+                    var bubuArea = new RectangleF(0, 0, 280, SpriteRenderer.HeightFor(560));
+                    Assert(GoldPixels(leftClick, bubuArea) > 20 && GoldPixels(rightClick, bubuArea) > 20, "left/right mouse visible highlights");
+                    Assert(GoldPixels(idleClick, bubuArea) == 0, "mouse highlight clears on release");
+                    int changed = 0;
+                    for (int y = 0; y < leftClick.Height; y++) for (int x = 0; x < 280; x++)
+                        if (leftClick.GetPixel(x, y) != rightClick.GetPixel(x, y)) changed++;
+                    Assert(changed > 20, "left/right mouse states render differently");
+                }
+                using (Bitmap middleClick = renderer.Render(560, false, false, 0, false, false, false, 0, null, true))
+                {
+                    int green = 0;
+                    for (int y = 0; y < middleClick.Height; y++) for (int x = 0; x < 280; x++)
+                    { Color c = middleClick.GetPixel(x, y); if (c.A > 200 && c.G > 210 && c.R < 160 && c.B < 200) green++; }
+                    Assert(green > 10, "middle button wheel visibly green");
+                }
+                RectangleF keyBoard = SpriteRenderer.KeyboardBounds(560, 0);
+                KeyCap mainOne = KeyboardLayout.Keys.Find(k => k.Code == 2);
+                KeyCap numOne = KeyboardLayout.Keys.Find(k => k.Code == 0x4f);
+                Assert(Math.Abs(KeyboardLayout.Bounds(keyBoard, numOne).Width - KeyboardLayout.Bounds(keyBoard, mainOne).Width) < 0.001,
+                    "standard equal-width numpad and letter keys");
+                Assert(Math.Abs(keyBoard.Width - 280 * 0.97f * 0.90f) < 0.001 && Math.Abs(keyBoard.Height - 280 * 0.29f * 0.90f) < 0.001,
+                    "approved B keyboard is 90 percent in both dimensions");
+                RectangleF spaceCap = KeyboardLayout.Bounds(keyBoard, KeyboardLayout.Keys.Find(k => k.Code == 0x39));
+                RectangleF numberCap = KeyboardLayout.Bounds(keyBoard, mainOne);
+                RectangleF numpadCap = KeyboardLayout.Bounds(keyBoard, numOne);
+                Assert(spaceCap.Top < numberCap.Top && numpadCap.Left > numberCap.Right,
+                    "rotated keyboard puts space near chin and numpad on screen right");
+                Assert(HandAnimator.Shoulder(keyBoard, Hand.Left).X < HandAnimator.Shoulder(keyBoard, Hand.Right).X,
+                    "physical left hand follows screen-left keys after rotation");
+                foreach (KeyCap a in KeyboardLayout.Keys)
+                {
+                    RectangleF ra = KeyboardLayout.Bounds(keyBoard, a);
+                    Assert(ra.Width > 0 && ra.Height > 0 && keyBoard.Contains(ra), "key stays in board");
+                    foreach (KeyCap b in KeyboardLayout.Keys)
+                        if (a.Code != b.Code) Assert(!ra.IntersectsWith(KeyboardLayout.Bounds(keyBoard, b)), "keys remain separate");
+                }
+                foreach (int idleWidth in new[] { 187, 319, 560 })
+                foreach (double idleGap in new[] { 0.0, 0.08 })
+                {
+                    RectangleF idleBoard = SpriteRenderer.KeyboardBounds(idleWidth, idleGap);
+                    float idlePet = idleWidth * (1f - (float)idleGap) / 2;
+                    PointF lh = HandAnimator.Target(idleBoard, null, Hand.Left);
+                    PointF rh = HandAnimator.Target(idleBoard, null, Hand.Right);
+                    float bodyCenter = idleWidth - idlePet / 2;
+                    Assert(Math.Abs(lh.X + rh.X - 2 * bodyCenter) < 0.001 && Math.Abs(lh.Y - rh.Y) < 0.001,
+                        "idle hands symmetric about character center at every tested size/gap");
+                    for (int pose = 0; pose < 4; pose++)
+                    using (Bitmap idle = renderer.Render(idleWidth, pose == 1, pose == 2, 0, false, false, pose == 3, idleGap))
+                    using (Bitmap bare = renderer.Render(idleWidth, pose == 1, pose == 2, 0, false, false, pose == 3, idleGap, null, false, null, false))
+                    {
+                        // Compare the entire bow rectangle, including its outline,
+                        // against a render with all hand layers disabled.
+                        int x0 = (int)Math.Floor(idleWidth - (264 - 45) * idlePet / 355);
+                        int x1 = (int)Math.Ceiling(idleWidth - (182 - 45) * idlePet / 355);
+                        int y0 = (int)Math.Floor((290 - 15) * idlePet / 355);
+                        int y1 = (int)Math.Ceiling((335 - 15) * idlePet / 355);
+                        for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++)
+                            Assert(idle.GetPixel(x, y).ToArgb() == bare.GetPixel(x, y).ToArgb(), "whole bow unobscured by idle hands");
+                    }
+                }
+                foreach (Hand side in new[] { Hand.Left, Hand.Right })
+                using (var idleArm = new Bitmap(560, SpriteRenderer.HeightFor(560)))
+                using (Graphics g = Graphics.FromImage(idleArm))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    InputArtwork.Arm(g, HandAnimator.Shoulder(keyBoard, side), HandAnimator.Target(keyBoard, null, side), 280);
+                    int minX = 560, maxX = 0, minY = idleArm.Height, maxY = 0;
+                    for (int y = 0; y < idleArm.Height; y++) for (int x = 0; x < idleArm.Width; x++)
+                        if (idleArm.GetPixel(x, y).A > 128) { minX = Math.Min(minX, x); maxX = Math.Max(maxX, x); minY = Math.Min(minY, y); maxY = Math.Max(maxY, y); }
+                    Assert(Math.Abs((maxX - minX) - (maxY - minY)) <= 1 && maxX - minX > 50, "idle mitten is round and full");
+                }
+                for (int pose = 0; pose < 4; pose++)
+                using (Bitmap bowFrame = renderer.Render(560, pose == 1, pose == 2, 0, false, false, pose == 3, 0, null, false, null, false))
+                {
+                    foreach (int sx in new[] { 199, 222, 245 })
+                    {
+                        Color c = bowFrame.GetPixel((int)(560 - (sx - 45) * 280f / 355), (int)((310 - 15) * 280f / 355));
+                        Assert(c.A > 250 && c.R == 0 && c.G == 0 && c.B == 0, "bow remains pure black in every expression");
+                    }
+                }
+                foreach (KeyCap cap in KeyboardLayout.Keys)
+                {
+                    if (cap.Label.Length != 1 || !char.IsLetter(cap.Label[0])) continue;
+                    Hand side = InputState.Classify((ushort)(cap.Code & 0xff), (cap.Code & 0x100) != 0);
+                    RectangleF key = KeyboardLayout.Bounds(keyBoard, cap);
+                    PointF target = HandAnimator.Target(keyBoard, cap.Code, side);
+                    Assert(HandAnimator.Distance(target, new PointF(key.X + key.Width/2, key.Y + key.Height/2)) < 0.001, "letter contact exactly on key center");
+                    using (Bitmap withHands = renderer.Render(560, side == Hand.Left, side == Hand.Right, 0, false, false, false, 0, new SortedSet<int> { cap.Code }))
+                    using (Bitmap noHands = renderer.Render(560, side == Hand.Left, side == Hand.Right, 0, false, false, false, 0, new SortedSet<int> { cap.Code }, false, null, false))
+                    {
+                        int white = 0;
+                        for (int y = (int)target.Y - 28; y < (int)target.Y - 10; y++)
+                        for (int x = (int)target.X - 8; x < (int)target.X + 8; x++)
+                        {
+                            Color a = withHands.GetPixel(x, y), b = noHands.GetPixel(x, y);
+                            if (a.A > 240 && a.R > 245 && a.G > 245 && a.B > 245 && a.ToArgb() != b.ToArgb()) white++;
+                        }
+                        Assert(white > 10, "visible moving paw at letter " + cap.Label);
+                        int dot = 6;
+                        for (int y = (int)Math.Ceiling(keyBoard.Bottom) + 1; y < withHands.Height - dot - 1; y++)
+                        for (int x = 0; x < withHands.Width; x++)
+                            Assert(withHands.GetPixel(x, y).A == 0, "no gray input preview strip");
+                    }
+                }
+                int w = 440, fh = SpriteRenderer.HeightFor(w);
+                using (Bitmap storyboard = new Bitmap(w * 4, fh * 2))
+                using (Graphics g = Graphics.FromImage(storyboard))
+                {
+                    var demo = new HandAnimator();
+                    long[] times = { 0, 32, 64, 128, 192, 256, 320, 384 };
+                    for (int i = 0; i < times.Length; i++)
+                    {
+                        int? l = i > 0 && i < 6 ? (int?)0x1e : null;
+                        int? r = i == 4 || i == 5 ? (int?)0x26 : null;
+                        var active = new SortedSet<int>(); if (l.HasValue) active.Add(l.Value); if (r.HasValue) active.Add(r.Value);
+                        PawFrame pose = demo.Step(SpriteRenderer.KeyboardBounds(w, 0), l, r, times[i]);
+                        using (Bitmap frame = renderer.Render(w, l.HasValue, r.HasValue, 0, false, false, false, 0, active, false, pose))
+                            g.DrawImageUnscaled(frame, (i % 4) * w, (i / 4) * fh);
+                    }
+                    storyboard.Save(Path.Combine(root, "reach-preview.png"), ImageFormat.Png);
+                }
             }
             var mouse = new MouseState();
             mouse.Edges(1, 1, 0); mouse.Edges(1, 4, 1);
@@ -641,6 +931,59 @@ namespace YierBubu
             Assert(!mouse.Active(false, 701), "mouse device removal");
             mouse.Edges(4, 1, 800); mouse.Reset();
             Assert(!mouse.Active(true, 801), "mouse session reset");
+            mouse.Edges(5, 16, 900); Assert(mouse.Middle(1000) && !mouse.Active(true, 1000), "middle button independent");
+            mouse.Edges(5, 32, 1001); Assert(mouse.Middle(1020) && !mouse.Middle(1100), "middle click pulse expires");
+            mouse.Reset(); Assert(!mouse.Middle(1101), "middle reset");
+            var exact = new InputState();
+            exact.Edge(Key(0x1e, 1), 65, true, 0); string aStamp = string.Join(",", exact.VisibleKeys(10));
+            exact.Edge(Key(0x1e, 1), 65, false, 20); exact.Edge(Key(0x1f, 1), 83, true, 200);
+            Assert(aStamp != string.Join(",", exact.VisibleKeys(210)), "same-hand key changes invalidate snapshot");
+            exact.Edge(Key(0x1f, 2), 83, true, 220); exact.Edge(Key(0x1f, 1), 83, false, 230);
+            Assert(exact.VisibleKeys(400).Contains(0x1f), "same key on second keyboard remains visible");
+            exact.RemoveDevice(2); Assert(!exact.VisibleKeys(401).Contains(0x1f), "exact key device removal clears");
+            exact.Edge(Key(0x20, 1), 68, true, 500); exact.Edge(Key(0x20, 1), 68, false, 501);
+            Assert(exact.VisibleKeys(550).Contains(0x20) && !exact.VisibleKeys(650).Contains(0x20), "exact-key short tap pulse");
+            exact.Reset(); Assert(exact.VisibleKeys(651).Count == 0, "exact reset clears pulses");
+            var reaching = new InputState();
+            reaching.Edge(Key(0x1e, 1), 65, true, 0);
+            reaching.Edge(Key(0x1f, 1), 83, true, 10);
+            Assert(reaching.LatestKey(Hand.Left, 20) == 0x1f, "last pressed same-hand letter wins");
+            reaching.Edge(Key(0x1d, 1), 0xa2, true, 30);
+            Assert(reaching.LatestKey(Hand.Left, 40) == 0x1f, "modifier does not steal letter target");
+            reaching.Edge(Key(0x1f, 1), 83, false, 50);
+            Assert(reaching.LatestKey(Hand.Left, 60) == 0x1e, "release restores remaining held letter");
+            reaching.Edge(Key(0x24, 1), 74, true, 70);
+            Assert(reaching.LatestKey(Hand.Right, 80) == 0x24 && reaching.LatestKey(Hand.Left, 80) == 0x1e, "two hand targets independent");
+            reaching.Reset(); Assert(!reaching.LatestKey(Hand.Left, 81).HasValue, "reset clears hand targets");
+            var animator = new HandAnimator();
+            RectangleF keyboard = SpriteRenderer.KeyboardBounds(560, 0);
+            PointF goal = HandAnimator.Target(keyboard, 0x1e, Hand.Left);
+            PawFrame frame0 = animator.Step(keyboard, null, null, 0);
+            PawFrame moving = animator.Step(keyboard, 0x1e, null, 16);
+            Assert(moving.Moving && HandAnimator.Distance(moving.Left, goal) < HandAnimator.Distance(frame0.Left, goal) && HandAnimator.Distance(moving.Left, goal) > 0.1, "smooth reach without instant jump");
+            PawFrame arrived = moving;
+            for (int t = 32; t <= 256; t += 16) arrived = animator.Step(keyboard, 0x1e, null, t);
+            Assert(HandAnimator.Distance(arrived.Left, goal) < 0.4, "paw reaches exact A center");
+            for (int t = 272; t <= 528; t += 16) arrived = animator.Step(keyboard, null, null, t);
+            Assert(HandAnimator.Distance(arrived.Left, frame0.Left) < 0.4, "paw returns home on release");
+            animator.Reset();
+            RectangleF smallBoard = SpriteRenderer.KeyboardBounds(187, 0);
+            Assert(HandAnimator.Distance(animator.Step(smallBoard, null, null, 600).Left, HandAnimator.Target(smallBoard, null, Hand.Left)) < 0.01, "resize resets old-scale coordinates");
+            using (Bitmap mouseCanvas = new Bitmap(100, 50))
+            using (Graphics g = Graphics.FromImage(mouseCanvas))
+            {
+                Color blue = Color.FromArgb(140, 190, 235); g.Clear(blue);
+                InputArtwork.Mouse(g, new RectangleF(0, 0, 100, 50), false, false, false);
+                for (int y = 15; y < 30; y++) for (int x = 15; x < 32; x++)
+                {
+                    Assert(mouseCanvas.GetPixel(x, y).ToArgb() == blue.ToArgb(), "mouse right label removed");
+                    Assert(mouseCanvas.GetPixel(x + 50, y).ToArgb() == blue.ToArgb(), "mouse left label removed");
+                }
+            }
+            Assert(PhysicalKey.FromRaw(1, 0x45, 4, 0x13).Code == 0x245, "Pause E1 identity");
+            Assert(PhysicalKey.FromRaw(1, 0x45, 2, 0x90).Code == 0x45, "NumLock is not Pause");
+            Assert(PhysicalKey.FromRaw(1, 0x54, 0, 0x2c).Code == 0x137, "PrintScreen normalization");
+            Assert(PhysicalKey.FromRaw(1, 0x1c, 2, 0x0d).Code == 0x11c, "numpad Enter independent");
             Assert(SpriteRenderer.BubuPose(0, true, false) == 3 && SpriteRenderer.BubuPose(0, false, true) == 3 && SpriteRenderer.BubuPose(0, true, true) == 3, "one mouse paw for either button and chord");
             // The final global flip moves original-left button/key to screen-right.
             Assert(SpriteRenderer.KeyboardPose(true, false, false) == 1 && SpriteRenderer.KeyboardPose(false, true, false) == 2, "keyboard source poses remain physical before mirror");
@@ -655,7 +998,7 @@ namespace YierBubu
                 Assert(again.Width == 238 && again.GapRatio == 0.02, "config atomic save and reload");
             }
             finally { if (File.Exists(configTest)) File.Delete(configTest); }
-            File.WriteAllText(Path.Combine(root, "self-test.txt"), "PASS: outer screen-left mouse position in all four Bubu poses; keyboard and independent mouse state/recovery; 72 exclusive head/ear pixel regressions; corrected gaze selection; config atomic save/reload; transparent state/mouse/gaze atlases.\r\n");
+            File.WriteAllText(Path.Combine(root, "self-test.txt"), "PASS: round idle mittens; pure-black bow; space near chin and numpad on screen right; standard numpad proportions; 90-percent keyboard with separate keys; symmetric idle hands and unobscured bow across sizes/expressions; 104 exact key highlights; animated exact-key reach and release/resize recovery; latest-letter selection and independent hands; mouse glyphs removed; no caption strip; keyboard and mouse recovery; 72 head/ear regressions; config save/reload.\r\n");
         }
 
         [STAThread]
