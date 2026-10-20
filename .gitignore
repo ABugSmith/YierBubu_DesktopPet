@@ -1,0 +1,9 @@
+*.exe
+*.pdb
+*.zip
+*.sha256
+app/*-preview.png
+app/self-test.txt
+app/smoke.txt
+.vs/
+_local/

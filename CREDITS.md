@@ -1,0 +1,25 @@
+﻿# 来源、致谢与权利说明
+
+## BongoCat
+
+本项目引用并参考 [ayangweb/BongoCat](https://github.com/ayangweb/BongoCat) 的桌面宠物交互思路。BongoCat 的作者与贡献者保有其作品的权利；上游仓库标注 Apache-2.0，具体以[上游 LICENSE](https://github.com/ayangweb/BongoCat/blob/master/LICENSE) 为准。
+
+当前便携程序为独立 C#/Win32 实现，没有将上游 Rust/Live2D 主工程打包进本仓库。致谢不表示原项目参与开发或为本项目背书。
+
+## 一二布布
+
+一二布布角色与原表情包的作者为[黄小B](https://weibo.com/u/2623471650)。感谢原作者用可爱的角色和细腻的表情，创造了让人感到温暖的日常陪伴。
+
+本项目使用一二布布表情包作为形象参考；桌宠姿势包含 AI 辅助制作的 PNG 与程序绘制的手部和键盘。AI 辅助制作不改变原角色的权利归属，也不代表取得了角色、商标或原表情包的再授权。
+
+没有将角色或表情包声明为“开源素材”，也没有在本仓库获得原作者官方授权或合作的证明。请勿将本仓库的发布理解为原作者对素材再分发、商业使用或品牌使用的许可；相关使用应遵循权利人的授权。
+
+## 本仓库代码
+
+本次发布公开源码供查看与学习，暂未为新增代码指定独立开源许可证。上游代码许可与角色素材权利分别适用，不能因其中一部分可公开访问，就将全部文件视为采用同一许可。
+
+## 公开核对来源
+
+- BongoCat 项目：https://github.com/ayangweb/BongoCat
+- BongoCat 许可：https://github.com/ayangweb/BongoCat/blob/master/LICENSE
+- 黄小B 主页（简介标明“一二和布布作者”）：https://weibo.com/u/2623471650
